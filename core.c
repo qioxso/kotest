@@ -135,12 +135,48 @@ static int install_wide_breakpoint(pid_t pid, uintptr_t addr) {
     return 0;
 }
 
-static void uninstall_wide_breakpoint(void) {
+static int install_wide_breakpoint(pid_t pid, uintptr_t addr) {
+    struct perf_event_attr attr;
+    int err;
+
     if (g_bp_events) {
         unregister_wide_hw_breakpoint(g_bp_events);
         g_bp_events = NULL;
-        printk(KERN_INFO "[Shami] HWBP Removed.\n");
     }
+
+    g_target_pid = pid;
+
+    hw_breakpoint_init(&attr);
+    attr.bp_addr = addr;
+    attr.bp_len = HW_BREAKPOINT_LEN_4;
+    attr.bp_type = HW_BREAKPOINT_X;
+    
+    // >>>>>>>>>> 修改开始 <<<<<<<<<<
+    
+    // 1. 强占模式 (保持开启)
+    attr.pinned = 1;     
+    attr.exclusive = 1;  
+
+    // 2. 缩小监控范围 (关键修改!)
+    // 显式告诉内核：我们不监控内核态和虚拟机，只监控用户APP
+    // 这有助于避开一些系统级的冲突
+    attr.exclude_kernel = 1; 
+    attr.exclude_hv = 1;     
+
+    // >>>>>>>>>> 修改结束 <<<<<<<<<<
+
+    g_bp_events = register_wide_hw_breakpoint(&attr, my_bp_handler, NULL);
+
+    if (IS_ERR((void __force *)g_bp_events)) {
+        err = PTR_ERR((void __force *)g_bp_events);
+        // 打印更详细的错误
+        printk(KERN_ERR "[Shami] Failed to install HWBP: %d (Addr: %lx, PID: %d)\n", err, addr, pid);
+        g_bp_events = NULL;
+        return err;
+    }
+
+    printk(KERN_INFO "[Shami] HWBP Installed at 0x%lx (User-Mode Only)\n", addr);
+    return 0;
 }
 
 // ==========================================
