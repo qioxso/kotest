@@ -10,7 +10,7 @@
 #include <linux/sched/mm.h>
 #include <linux/pid.h>
 #include <linux/cpu.h>
-#include <linux/kdebug.h> // 必须引入，用于 die_notifier
+#include <linux/kdebug.h>
 #include <linux/notifier.h>
 #include <asm/debug-monitors.h> 
 
@@ -18,29 +18,34 @@
 
 #define DEVICE_NAME "shami"
 
-// 全局变量
+// 全局变量保存断点信息
 static pid_t g_target_pid = 0;
 static uintptr_t g_target_addr = 0;
+static uint32_t g_orig_insn = 0; // 保存原始指令
 
 // ==========================================
-// >>>>>>>>>> GUP (保留原样) <<<<<<<<<<
+// >>>>>>>>>> GUP 内存读写 (保持不变) <<<<<<<<<<
 // ==========================================
+
 static int read_memory_force(struct mm_struct *mm, unsigned long addr, void *buffer, size_t size) {
     struct page *page;
     void *maddr;
     int res;
     size_t bytes_read = 0;
+    
+    mmap_read_lock(mm);
     while (bytes_read < size) {
         size_t offset = (addr + bytes_read) & ~PAGE_MASK;
         size_t bytes_to_copy = min(size - bytes_read, PAGE_SIZE - offset);
         res = get_user_pages_remote(mm, addr + bytes_read, 1, FOLL_FORCE, &page, NULL, NULL);
-        if (res <= 0) return -1;
+        if (res <= 0) { mmap_read_unlock(mm); return -1; }
         maddr = kmap_atomic(page);
         memcpy(buffer + bytes_read, maddr + offset, bytes_to_copy);
         kunmap_atomic(maddr);
         put_page(page);
         bytes_read += bytes_to_copy;
     }
+    mmap_read_unlock(mm);
     return 0;
 }
 
@@ -49,11 +54,13 @@ static int write_memory_force(struct mm_struct *mm, unsigned long addr, void *da
     void *maddr;
     int res;
     size_t bytes_written = 0;
+
+    mmap_read_lock(mm);
     while (bytes_written < size) {
         size_t offset = (addr + bytes_written) & ~PAGE_MASK;
         size_t bytes_to_copy = min(size - bytes_written, PAGE_SIZE - offset);
         res = get_user_pages_remote(mm, addr + bytes_written, 1, FOLL_WRITE | FOLL_FORCE, &page, NULL, NULL);
-        if (res <= 0) return -1;
+        if (res <= 0) { mmap_read_unlock(mm); return -1; }
         maddr = kmap_atomic(page);
         memcpy(maddr + offset, data + bytes_written, bytes_to_copy);
         kunmap_atomic(maddr);
@@ -61,110 +68,60 @@ static int write_memory_force(struct mm_struct *mm, unsigned long addr, void *da
         put_page(page);
         bytes_written += bytes_to_copy;
     }
+    mmap_read_unlock(mm);
     return 0;
 }
 
 // ==========================================
-// >>>>>>>>>> 核心：异常截获 (打印堆栈) <<<<<<<<<<
+// >>>>>>>>>> 核心：异常截获 & 自动恢复 <<<<<<<<<<
 // ==========================================
 
-// 当硬件断点触发，但没有 perf 处理时，内核会发送 die notification
 static int my_die_handler(struct notifier_block *self, unsigned long val, void *data)
 {
     struct die_args *args = (struct die_args *)data;
     struct pt_regs *regs = args->regs;
 
-    // 过滤：如果不是我们关注的进程，直接忽略，让系统自己处理（可能会导致crash）
+    // 1. 过滤进程
     if (g_target_pid != 0 && current->tgid != g_target_pid) {
         return NOTIFY_DONE; 
     }
 
-    // 只有当原因是 Debug 异常时才处理 (DIE_DEBUG 在 arm64 上通常对应 1)
-    // 但为了保险，我们只要是这个进程的异常都打印一下看看
+    // 2. 确认是否是我们的断点地址触发的异常
+    // 注意：BRK 触发时，PC 指针通常指向 BRK 指令的地址
+    if (regs->pc != g_target_addr) {
+        return NOTIFY_DONE;
+    }
+
+    printk(KERN_ALERT "\n[Shami] >>> BP HIT! Resuming... <<<\n");
+    // 打印你关心的寄存器
+    printk(KERN_ALERT "PC: %016llx  X0: %016llx  X1: %016llx\n", regs->pc, regs->regs[0], regs->regs[1]);
+    printk(KERN_ALERT "X2: %016llx  X3: %016llx  X8: %016llx\n", regs->regs[2], regs->regs[3], regs->regs[8]);
     
-    printk(KERN_ALERT "\n[Shami] >>> HIT! (Via Die Notifier) <<<\n");
-    printk(KERN_ALERT "PID: %d | PC: 0x%llx | SP: 0x%llx\n", current->tgid, regs->pc, regs->sp);
-    
-    // 打印 X0 - X5
-    printk(KERN_ALERT "X0: %016llx  X1: %016llx\n", regs->regs[0], regs->regs[1]);
-    printk(KERN_ALERT "X2: %016llx  X3: %016llx\n", regs->regs[2], regs->regs[3]);
-    printk(KERN_ALERT "X4: %016llx  X5: %016llx\n", regs->regs[4], regs->regs[5]);
+    // 3. [关键步骤] 还原指令！
+    // 我们把原本的指令写回内存，覆盖掉 BRK
+    // 因为我们在异常上下文中，直接用 write_memory_force 是最方便的
+    // 注意：这里用 current->mm 是安全的，因为当前就是目标进程的上下文
+    if (g_orig_insn != 0) {
+        int ret = write_memory_force(current->mm, g_target_addr, &g_orig_insn, 4);
+        if (ret == 0) {
+            printk(KERN_ALERT "[Shami] Instruction restored: %08x\n", g_orig_insn);
+        } else {
+            printk(KERN_ERR "[Shami] Failed to restore instruction!\n");
+            // 如果还原失败，App 肯定会崩溃，但我们尽力了
+        }
+    }
 
-    // 打印堆栈
-    dump_stack();
-
-    // [关键] 为了防止死循环，我们必须在这里移除断点
-    // 因为这是在异常上下文中，我们不能简单地调用 uninstall，只能暂时让它通过
-    // 但硬件断点是顽固的，不关掉就会无限触发。
-    // 这里我们尝试修改寄存器关闭断点 (简单粗暴)
-    asm volatile("msr dbgbcr0_el1, %0" : : "r" (0UL));
-    isb();
-
-    printk(KERN_ALERT "[Shami] HWBP Disabled automatically.\n");
-
-    return NOTIFY_STOP; // 告诉内核：我已经处理了这个异常，不要杀掉进程
+    // 4. [欺骗内核]
+    // 返回 NOTIFY_STOP，告诉内核 "我处理完了，没事了"。
+    // 内核会直接退出异常处理流程，让 CPU 重新执行当前的 PC。
+    // 因为我们刚刚把 PC 处的指令改回了正确的指令，所以 APP 会继续正常运行！
+    return NOTIFY_STOP;
 }
 
 static struct notifier_block my_nb = {
     .notifier_call = my_die_handler,
-    .priority = 0x7fffffff // 最高优先级
+    .priority = 0x7fffffff
 };
-
-// ==========================================
-// >>>>>>>>>> 核心：暴力汇编操作 (带总闸) <<<<<<<<<<
-// ==========================================
-
-static void install_force_on_cpu(void *info) {
-    unsigned long addr = g_target_addr;
-    u32 ctrl;
-    u64 mdscr;
-
-    // 1. 解锁 OSLAR
-    asm volatile("msr oslar_el1, xzr" : : : "memory");
-    isb();
-
-    // 2. [新增] 开启总闸 MDSCR_EL1 (Monitor Debug System Control Register)
-    // 读取当前值
-    asm volatile("mrs %0, mdscr_el1" : "=r" (mdscr));
-    // 检查 Bit 15 (MDE - Monitor Debug Enable) 是否开启
-    if ((mdscr & (1UL << 15)) == 0) {
-        mdscr |= (1UL << 15); // 强制开启 MDE
-        asm volatile("msr mdscr_el1, %0" : : "r" (mdscr));
-        isb();
-    }
-    // 确保 KDE (Kernel Debug Enable) 也是开启的 (Bit 13)，虽然我们监控用户态
-    if ((mdscr & (1UL << 13)) == 0) {
-        mdscr |= (1UL << 13); 
-        asm volatile("msr mdscr_el1, %0" : : "r" (mdscr));
-        isb();
-    }
-
-    // 3. 暴力关闭所有槽位，腾出空间
-    asm volatile("msr dbgbcr0_el1, %0" : : "r" (0UL));
-    asm volatile("msr dbgbcr1_el1, %0" : : "r" (0UL));
-    asm volatile("msr dbgbcr2_el1, %0" : : "r" (0UL));
-    asm volatile("msr dbgbcr3_el1, %0" : : "r" (0UL));
-    asm volatile("msr dbgbcr4_el1, %0" : : "r" (0UL));
-    asm volatile("msr dbgbcr5_el1, %0" : : "r" (0UL));
-    isb();
-
-    // 4. 写入 Slot 0
-    asm volatile("msr dbgbvr0_el1, %0" : : "r" (addr));
-    
-    // Enable=1, PMC=0x3 (EL0+EL1), BAS=0xF
-    // 开启用户态和内核态监控，确保不错过
-    ctrl = (1 << 0) | (3 << 1) | (0xf << 5); 
-    
-    asm volatile("msr dbgbcr0_el1, %0" : : "r" ((unsigned long)ctrl));
-    isb();
-}
-
-static void uninstall_force_on_cpu(void *info) {
-    asm volatile("msr oslar_el1, xzr" : : : "memory");
-    isb();
-    asm volatile("msr dbgbcr0_el1, %0" : : "r" (0UL));
-    isb();
-}
 
 // ==========================================
 // >>>>>>>>>> IOCTL <<<<<<<<<<
@@ -173,8 +130,9 @@ static void uninstall_force_on_cpu(void *info) {
 static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     long ret = -EINVAL;
     COPY_MEMORY cm;
-    HWBP_INFO bp_info;
+    SWBP_INFO bp_info;
     void *kbuf = NULL;
+    uint32_t brk_opcode = 0xD4200000; // BRK #0 指令
 
     if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
         if (copy_from_user(&cm, (void __user *)arg, sizeof(cm))) return -EFAULT;
@@ -184,41 +142,83 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
 
     switch (cmd) {
         case OP_READ_MEM: 
-            // 简单实现 GUP 调用
-            if (read_memory_force(current->mm, cm.addr, kbuf, cm.size) == 0) {
-                 if (copy_to_user(cm.buffer, kbuf, cm.size)) ret = -EFAULT;
-                 else ret = 0;
+            pid_struct = find_get_pid(cm.pid);
+            if (pid_struct) {
+                task = get_pid_task(pid_struct, PIDTYPE_PID);
+                if (task) {
+                    mm = get_task_mm(task);
+                    if (mm) {
+                        if (read_memory_force(mm, cm.addr, kbuf, cm.size) == 0) {
+                             if (copy_to_user(cm.buffer, kbuf, cm.size)) ret = -EFAULT;
+                             else ret = 0;
+                        }
+                        mmput(mm);
+                    }
+                    put_task_struct(task);
+                }
+                put_pid(pid_struct);
             }
             break;
+
         case OP_WRITE_MEM:
-            // 简单实现 GUP 调用
-            if (write_memory_force(current->mm, cm.addr, kbuf, cm.size) == 0) ret = 0;
+            // ... (同上，省略重复代码) ...
+            if (copy_from_user(kbuf, cm.buffer, cm.size)) { kfree(kbuf); return -EFAULT; }
+             pid_struct = find_get_pid(cm.pid);
+            if (pid_struct) {
+                task = get_pid_task(pid_struct, PIDTYPE_PID);
+                if (task) {
+                    mm = get_task_mm(task);
+                    if (mm) {
+                        if (write_memory_force(mm, cm.addr, kbuf, cm.size) == 0) ret = 0;
+                        mmput(mm);
+                    }
+                    put_task_struct(task);
+                }
+                put_pid(pid_struct);
+            }
             break;
 
-        case OP_SET_HWBP:
+        case OP_SET_SWBP:
             if (copy_from_user(&bp_info, (void __user *)arg, sizeof(bp_info))) return -EFAULT;
             
             g_target_pid = bp_info.pid;
             g_target_addr = bp_info.addr;
+            g_orig_insn = bp_info.orig_instruction; // 保存原始指令
 
-            // 注册异常通知链 (只注册一次)
-            // 这样当异常发生时，my_die_handler 会被调用
+            // 1. 注册异常捕获
+            // 为了防止重复注册报错，先尝试卸载
+            unregister_die_notifier(&my_nb);
             register_die_notifier(&my_nb);
 
-            cpus_read_lock();
-            on_each_cpu(install_force_on_cpu, NULL, 1);
-            cpus_read_unlock();
-            
-            printk(KERN_ALERT "[Shami] FORCE INSTALLED HWBP + MDSCR Enabled\n");
-            ret = 0;
+            // 2. 写入 BRK 指令
+            // 我们需要在内核里帮用户写入 BRK，而不是让用户在 test.cpp 里写
+            // 这样更原子化
+            pid_struct = find_get_pid(g_target_pid);
+            if (pid_struct) {
+                task = get_pid_task(pid_struct, PIDTYPE_PID);
+                if (task) {
+                    mm = get_task_mm(task);
+                    if (mm) {
+                        if (write_memory_force(mm, g_target_addr, &brk_opcode, 4) == 0) {
+                             printk(KERN_ALERT "[Shami] SWBP Set at %lx. Backup: %08x\n", g_target_addr, g_orig_insn);
+                             ret = 0;
+                        } else {
+                             printk(KERN_ERR "[Shami] Failed to write BRK instruction\n");
+                             ret = -EFAULT;
+                        }
+                        mmput(mm);
+                    }
+                    put_task_struct(task);
+                }
+                put_pid(pid_struct);
+            }
             break;
 
-        case OP_DEL_HWBP:
+        case OP_DEL_SWBP:
             unregister_die_notifier(&my_nb);
-            cpus_read_lock();
-            on_each_cpu(uninstall_force_on_cpu, NULL, 1);
-            cpus_read_unlock();
-            printk(KERN_ALERT "[Shami] FORCE REMOVED HWBP\n");
+            // 这里可选：如果用户想手动移除断点，也可以把 g_orig_insn 写回去
+            // 但通常触发一次后就会自动移除
+            printk(KERN_ALERT "[Shami] SWBP Removed\n");
             ret = 0;
             break;
 
@@ -231,10 +231,7 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
     return ret;
 }
 
-// ==========================================
-// >>>>>>>>>> 驱动注册 <<<<<<<<<<
-// ==========================================
-
+// ... 注册部分保持不变 ...
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .unlocked_ioctl = shami_ioctl,
@@ -249,15 +246,12 @@ static int __init shami_init(void) {
     if (major < 0) return major;
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Driver Loaded (NUCLEAR V2 - Die Notifier).\n");
+    printk(KERN_INFO "[Shami] Driver Loaded (Auto-Resume SWBP).\n");
     return 0;
 }
 
 static void __exit shami_exit(void) {
     unregister_die_notifier(&my_nb);
-    cpus_read_lock();
-    on_each_cpu(uninstall_force_on_cpu, NULL, 1);
-    cpus_read_unlock();
     device_destroy(shami_class, MKDEV(major, 0));
     class_destroy(shami_class);
     unregister_chrdev(major, DEVICE_NAME);
