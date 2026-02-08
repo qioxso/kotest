@@ -12,7 +12,6 @@
 #include <linux/cpu.h>
 #include <linux/ptrace.h>
 #include <linux/kprobes.h> 
-#include <linux/signal.h> // for siginfo
 
 #include "comm.h"
 
@@ -22,10 +21,10 @@
 static pid_t g_target_pid = 0;
 static uintptr_t g_target_addr = 0;
 static uint32_t g_orig_insn = 0;
-static bool g_kprobes_registered = false;
+static bool g_kprobe_registered = false;
 
 // ==========================================
-// >>>>>>>>>> GUP 内存读写 (保持不变) <<<<<<<<<<
+// >>>>>>>>>> GUP 内存读写 <<<<<<<<<<
 // ==========================================
 
 static int read_memory_force(struct mm_struct *mm, unsigned long addr, void *buffer, size_t size) {
@@ -74,89 +73,61 @@ static int write_memory_force(struct mm_struct *mm, unsigned long addr, void *da
 }
 
 // ==========================================
-// >>>>>>>>>> 核心：Hook force_sig_info <<<<<<<<<<
+// >>>>>>>>>> Kprobe 拦截 do_debug_exception <<<<<<<<<<
 // ==========================================
 
-// int force_sig_info(struct kernel_siginfo *info);
-// X0 = info 指针
-static int handler_force_sig_info(struct kprobe *p, struct pt_regs *regs)
+// 函数原型：
+// void do_debug_exception(unsigned long addr_if_watchpoint, unsigned int esr, struct pt_regs *regs)
+// 参数寄存器: X0=addr, X1=esr, X2=regs(用户态寄存器指针)
+static int handler_debug_exception(struct kprobe *p, struct pt_regs *kregs)
 {
-    // 1. 快速检查进程
+    // 1. 检查进程
     if (g_target_pid == 0 || current->tgid != g_target_pid) {
         return 0; 
     }
 
-    // 2. 解析 siginfo (位于 X0 寄存器)
-    struct kernel_siginfo *info = (struct kernel_siginfo *)regs->regs[0];
-    if (!info) return 0;
-
-    // 3. 检查信号类型 (SIGTRAP = 5)
-    // kernel_siginfo 的第一个成员通常就是 si_signo
-    if (info->si_signo != SIGTRAP) {
-        return 0;
-    }
-
-    // 4. 上帝视角检查：当前用户态 PC 是否在断点处？
-    struct pt_regs *user_regs = task_pt_regs(current);
+    // 2. 获取 do_debug_exception 的第三个参数 (X2)
+    // 这个参数是指向用户态寄存器组 (struct pt_regs) 的指针
+    struct pt_regs *user_regs = (struct pt_regs *)kregs->regs[2];
+    
+    // 安全检查：指针是否有效
     if (!user_regs) return 0;
 
+    // 3. 检查断点地址
+    // 用户态 PC 此时应该停在 BRK 指令上
     if (user_regs->pc == g_target_addr) {
         
-        printk(KERN_ALERT "\n[Shami] >>> SWBP HIT! (Intercepted force_sig_info) <<<\n");
+        printk(KERN_ALERT "\n[Shami] >>> SWBP HIT! Intercepted do_debug_exception <<<\n");
         
         // 打印寄存器
         printk(KERN_ALERT "PC: %016llx  SP: %016llx\n", user_regs->pc, user_regs->sp);
         printk(KERN_ALERT "X0: %016llx  X1: %016llx\n", user_regs->regs[0], user_regs->regs[1]);
         printk(KERN_ALERT "X2: %016llx  X3: %016llx\n", user_regs->regs[2], user_regs->regs[3]);
         printk(KERN_ALERT "X4: %016llx  X5: %016llx\n", user_regs->regs[4], user_regs->regs[5]);
-        printk(KERN_ALERT "X8: %016llx  LR: %016llx\n", user_regs->regs[8], user_regs->regs[30]);
+        printk(KERN_ALERT "LR: %016llx\n", user_regs->regs[30]);
 
-        // 5. 还原指令
+        // 4. 还原指令
         if (g_orig_insn != 0) {
             write_memory_force(current->mm, g_target_addr, &g_orig_insn, 4);
-            printk(KERN_ALERT "[Shami] Instruction restored.\n");
+            printk(KERN_ALERT "[Shami] Instruction restored: %08x\n", g_orig_insn);
         }
 
-        // 6. 跳过原函数
-        // 让 force_sig_info 直接返回，不发送信号
-        instruction_pointer_set(regs, regs->regs[30]);
+        // 5. [魔法] 跳过 do_debug_exception
+        // 我们不想让内核继续处理这个异常（否则它会发现是 BRK 并发信号）
+        // 我们直接让 do_debug_exception 返回 void
+        // 方法：将内核 PC 设置为 LR (返回地址)
+        instruction_pointer_set(kregs, kregs->regs[30]);
 
-        return 1;
+        return 1; // Skip original function
     }
 
     return 0;
 }
 
-static struct kprobe kp_info = {
-    .symbol_name = "force_sig_info",
-    .pre_handler = handler_force_sig_info,
+static struct kprobe kp = {
+    .symbol_name = "do_debug_exception",
+    .pre_handler = handler_debug_exception,
 };
-
-// 备用 Hook：force_sig (有些内核通过这个封装)
-static int handler_force_sig(struct kprobe *p, struct pt_regs *regs)
-{
-    // force_sig(int sig) -> X0 是信号值
-    if (g_target_pid != 0 && current->tgid == g_target_pid && regs->regs[0] == SIGTRAP) {
-        struct pt_regs *user_regs = task_pt_regs(current);
-        if (user_regs && user_regs->pc == g_target_addr) {
-            printk(KERN_ALERT "\n[Shami] >>> SWBP HIT! (Intercepted force_sig) <<<\n");
-            // 打印、还原、跳过逻辑同上
-            printk(KERN_ALERT "PC: %016llx\n", user_regs->pc);
-            printk(KERN_ALERT "X0: %016llx  X1: %016llx\n", user_regs->regs[0], user_regs->regs[1]);
-            
-            if (g_orig_insn != 0) write_memory_force(current->mm, g_target_addr, &g_orig_insn, 4);
-            instruction_pointer_set(regs, regs->regs[30]);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static struct kprobe kp_sig = {
-    .symbol_name = "force_sig",
-    .pre_handler = handler_force_sig,
-};
-
 
 // ==========================================
 // >>>>>>>>>> IOCTL <<<<<<<<<<
@@ -221,20 +192,15 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             g_target_addr = bp_info.addr;
             g_orig_insn = bp_info.orig_instruction;
 
-            // 1. 注册 Hook (force_sig_info 和 force_sig)
-            if (!g_kprobes_registered) {
-                int c = 0;
-                if (register_kprobe(&kp_info) >= 0) {
-                     printk(KERN_INFO "[Shami] Hooked force_sig_info\n");
-                     c++;
+            // 1. 注册 Kprobe (Hook 异常入口)
+            if (!g_kprobe_registered) {
+                int err = register_kprobe(&kp);
+                if (err < 0) {
+                    printk(KERN_ERR "[Shami] Failed to hook do_debug_exception: %d\n", err);
+                    return err;
                 }
-                if (register_kprobe(&kp_sig) >= 0) {
-                     printk(KERN_INFO "[Shami] Hooked force_sig\n");
-                     c++;
-                }
-                
-                if (c > 0) g_kprobes_registered = true;
-                else printk(KERN_ERR "[Shami] Failed to hook any signal function!\n");
+                g_kprobe_registered = true;
+                printk(KERN_INFO "[Shami] Hooked do_debug_exception.\n");
             }
 
             // 2. 写入 BRK
@@ -259,11 +225,10 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             break;
 
         case OP_DEL_SWBP:
-            if (g_kprobes_registered) {
-                unregister_kprobe(&kp_info);
-                unregister_kprobe(&kp_sig);
-                g_kprobes_registered = false;
-                printk(KERN_INFO "[Shami] Hooks removed.\n");
+            if (g_kprobe_registered) {
+                unregister_kprobe(&kp);
+                g_kprobe_registered = false;
+                printk(KERN_INFO "[Shami] Kprobe removed.\n");
             }
             ret = 0;
             break;
@@ -291,15 +256,12 @@ static int __init shami_init(void) {
     if (major < 0) return major;
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Driver Loaded (Hook force_sig_info).\n");
+    printk(KERN_INFO "[Shami] Driver Loaded (Hook do_debug_exception).\n");
     return 0;
 }
 
 static void __exit shami_exit(void) {
-    if (g_kprobes_registered) {
-        unregister_kprobe(&kp_info);
-        unregister_kprobe(&kp_sig);
-    }
+    if (g_kprobe_registered) unregister_kprobe(&kp);
     device_destroy(shami_class, MKDEV(major, 0));
     class_destroy(shami_class);
     unregister_chrdev(major, DEVICE_NAME);
