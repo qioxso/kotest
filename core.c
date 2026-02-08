@@ -10,21 +10,21 @@
 #include <linux/sched/mm.h>
 #include <linux/pid.h>
 #include <linux/cpu.h>
-#include <linux/kdebug.h>
-#include <linux/notifier.h>
-#include <asm/debug-monitors.h> 
+#include <linux/ptrace.h>
+#include <linux/kprobes.h> // 必须引入
 
 #include "comm.h"
 
 #define DEVICE_NAME "shami"
 
-// 全局变量保存断点信息
+// 全局变量
 static pid_t g_target_pid = 0;
 static uintptr_t g_target_addr = 0;
-static uint32_t g_orig_insn = 0; // 保存原始指令
+static uint32_t g_orig_insn = 0;
+static bool g_kprobe_registered = false;
 
 // ==========================================
-// >>>>>>>>>> GUP 内存读写 (保持不变) <<<<<<<<<<
+// >>>>>>>>>> GUP 内存读写 <<<<<<<<<<
 // ==========================================
 
 static int read_memory_force(struct mm_struct *mm, unsigned long addr, void *buffer, size_t size) {
@@ -73,47 +73,55 @@ static int write_memory_force(struct mm_struct *mm, unsigned long addr, void *da
 }
 
 // ==========================================
-// >>>>>>>>>> 核心：异常截获 & 自动恢复 <<<<<<<<<<
+// >>>>>>>>>> Kprobe 拦截逻辑 <<<<<<<<<<
 // ==========================================
 
-static int my_die_handler(struct notifier_block *self, unsigned long val, void *data)
+// Hook 目标: force_sig_fault(int sig, int code, void __user *addr)
+// 寄存器参数: X0=sig, X1=code, X2=addr
+static int my_kprobe_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
-    struct die_args *args = (struct die_args *)data;
-    struct pt_regs *regs = args->regs;
+    int sig = regs->regs[0];        // 参数1: 信号
+    uintptr_t fault_addr = regs->regs[2]; // 参数3: 故障地址
 
-    // 1. 过滤进程
-    if (g_target_pid != 0 && current->tgid != g_target_pid) {
-        return NOTIFY_DONE; 
+    // 1. 检查进程
+    if (g_target_pid == 0 || current->tgid != g_target_pid) {
+        return 0; // 不处理
     }
 
-    // 2. 确认是否是我们的断点地址
-    if (regs->pc != g_target_addr) {
-        return NOTIFY_DONE;
-    }
-
-    printk(KERN_ALERT "\n[Shami] >>> BP HIT! Resuming... <<<\n");
-    // 打印寄存器 (PC, X0-X3, X8)
-    printk(KERN_ALERT "PC: %016llx  X0: %016llx  X1: %016llx\n", regs->pc, regs->regs[0], regs->regs[1]);
-    printk(KERN_ALERT "X2: %016llx  X3: %016llx  X8: %016llx\n", regs->regs[2], regs->regs[3], regs->regs[8]);
-    
-    // 3. [关键步骤] 还原指令！
-    if (g_orig_insn != 0) {
-        // 使用 current->mm 进行写入，因为当前就在目标进程上下文
-        int ret = write_memory_force(current->mm, g_target_addr, &g_orig_insn, 4);
-        if (ret == 0) {
-            printk(KERN_ALERT "[Shami] Instruction restored: %08x\n", g_orig_insn);
-        } else {
-            printk(KERN_ERR "[Shami] Failed to restore instruction!\n");
+    // 2. 检查信号类型 (SIGTRAP=5) 和 地址匹配
+    if (sig == 5 && fault_addr == g_target_addr) {
+        
+        printk(KERN_ALERT "\n[Shami] >>> SWBP HIT! (Intercepted by Kprobe) <<<\n");
+        
+        // 获取用户态崩溃时的寄存器
+        struct pt_regs *user_regs = task_pt_regs(current);
+        if (user_regs) {
+            printk(KERN_ALERT "PC: %016llx  SP: %016llx\n", user_regs->pc, user_regs->sp);
+            printk(KERN_ALERT "X0: %016llx  X1: %016llx\n", user_regs->regs[0], user_regs->regs[1]);
+            printk(KERN_ALERT "X2: %016llx  X3: %016llx\n", user_regs->regs[2], user_regs->regs[3]);
         }
+
+        // 3. 还原指令
+        if (g_orig_insn != 0) {
+            write_memory_force(current->mm, g_target_addr, &g_orig_insn, 4);
+            printk(KERN_ALERT "[Shami] Instruction restored.\n");
+        }
+
+        // 4. [魔法] 修改内核 PC 指针，跳过 force_sig_fault 函数体
+        // regs->regs[30] 是 LR (返回地址)。
+        // 将 PC 设为 LR，相当于执行了一个 "return"
+        instruction_pointer_set(regs, regs->regs[30]);
+
+        // 返回 1: 告诉 Kprobe "我改变了执行流，不要单步执行原函数了"
+        return 1;
     }
 
-    // 4. [欺骗内核] 返回 NOTIFY_STOP，让内核认为异常已处理，继续执行
-    return NOTIFY_STOP;
+    return 0;
 }
 
-static struct notifier_block my_nb = {
-    .notifier_call = my_die_handler,
-    .priority = 0x7fffffff
+static struct kprobe kp = {
+    .symbol_name = "force_sig_fault", // 自动查找地址，无需手动输入
+    .pre_handler = my_kprobe_pre_handler,
 };
 
 // ==========================================
@@ -121,16 +129,14 @@ static struct notifier_block my_nb = {
 // ==========================================
 
 static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-    // >>> 修复点：补全了变量定义 <<<
     struct task_struct *task;
     struct pid *pid_struct;
     struct mm_struct *mm;
-    
     long ret = -EINVAL;
     COPY_MEMORY cm;
     SWBP_INFO bp_info;
     void *kbuf = NULL;
-    uint32_t brk_opcode = 0xD4200000; // BRK #0 指令
+    uint32_t brk_opcode = 0xD4200000; // BRK #0
 
     if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
         if (copy_from_user(&cm, (void __user *)arg, sizeof(cm))) return -EFAULT;
@@ -159,7 +165,6 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             break;
 
         case OP_WRITE_MEM:
-            if (copy_from_user(kbuf, cm.buffer, cm.size)) { kfree(kbuf); return -EFAULT; }
              pid_struct = find_get_pid(cm.pid);
             if (pid_struct) {
                 task = get_pid_task(pid_struct, PIDTYPE_PID);
@@ -180,13 +185,20 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             
             g_target_pid = bp_info.pid;
             g_target_addr = bp_info.addr;
-            g_orig_insn = bp_info.orig_instruction; // 保存原始指令
+            g_orig_insn = bp_info.orig_instruction;
 
-            // 1. 注册异常捕获
-            unregister_die_notifier(&my_nb);
-            register_die_notifier(&my_nb);
+            // 1. 注册 Kprobe (自动通过符号名 force_sig_fault 挂钩)
+            if (!g_kprobe_registered) {
+                int err = register_kprobe(&kp);
+                if (err < 0) {
+                    printk(KERN_ERR "[Shami] Failed to register kprobe: %d. Try insmod again.\n", err);
+                    return err;
+                }
+                g_kprobe_registered = true;
+                printk(KERN_INFO "[Shami] Kprobe attached to force_sig_fault.\n");
+            }
 
-            // 2. 写入 BRK 指令
+            // 2. 写入 BRK
             pid_struct = find_get_pid(g_target_pid);
             if (pid_struct) {
                 task = get_pid_task(pid_struct, PIDTYPE_PID);
@@ -194,10 +206,9 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
                     mm = get_task_mm(task);
                     if (mm) {
                         if (write_memory_force(mm, g_target_addr, &brk_opcode, 4) == 0) {
-                             printk(KERN_ALERT "[Shami] SWBP Set at %lx. Backup: %08x\n", g_target_addr, g_orig_insn);
+                             printk(KERN_ALERT "[Shami] SWBP Set at %lx\n", g_target_addr);
                              ret = 0;
                         } else {
-                             printk(KERN_ERR "[Shami] Failed to write BRK instruction\n");
                              ret = -EFAULT;
                         }
                         mmput(mm);
@@ -209,8 +220,11 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             break;
 
         case OP_DEL_SWBP:
-            unregister_die_notifier(&my_nb);
-            printk(KERN_ALERT "[Shami] SWBP Removed\n");
+            if (g_kprobe_registered) {
+                unregister_kprobe(&kp);
+                g_kprobe_registered = false;
+                printk(KERN_INFO "[Shami] Kprobe removed.\n");
+            }
             ret = 0;
             break;
 
@@ -223,7 +237,6 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
     return ret;
 }
 
-// ... 注册部分保持不变 ...
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .unlocked_ioctl = shami_ioctl,
@@ -238,12 +251,12 @@ static int __init shami_init(void) {
     if (major < 0) return major;
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Driver Loaded (Auto-Resume SWBP).\n");
+    printk(KERN_INFO "[Shami] Driver Loaded (KPROBE MODE).\n");
     return 0;
 }
 
 static void __exit shami_exit(void) {
-    unregister_die_notifier(&my_nb);
+    if (g_kprobe_registered) unregister_kprobe(&kp);
     device_destroy(shami_class, MKDEV(major, 0));
     class_destroy(shami_class);
     unregister_chrdev(major, DEVICE_NAME);
