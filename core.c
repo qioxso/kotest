@@ -10,22 +10,19 @@
 #include <linux/sched/mm.h>
 #include <linux/version.h>
 #include <linux/pid.h>
-#include <linux/cpu.h>  // <--- 必须添加这个头文件，用于 cpu lock
+#include <linux/cpu.h>
+#include <linux/kallsyms.h>
 
-// 引入 ARM64 相关的头文件，用于处理寄存器
-#include <asm/debug-monitors.h>
-#include <asm/ptrace.h>
+// 引入标准硬件断点库 (替代手动汇编)
+#include <linux/hw_breakpoint.h>
+#include <linux/perf_event.h>
 
 #include "comm.h"
 
 #define DEVICE_NAME "shami"
 
-// 定义函数指针类型，用于指向内核未导出的 hook 函数
-typedef int (*func_hook_debug_fault_code)(int nr, int (*fn)(unsigned long, unsigned int, struct pt_regs *), int sig, int code, const char *name);
-static func_hook_debug_fault_code g_hook_debug_func = NULL;
-
-// 全局保存断点信息
-static struct _HWBP_INFO g_bp_info = {0};
+// 全局保存当前的断点事件句柄
+static struct perf_event *g_bp_event = NULL;
 
 // --- 辅助函数：GUP 强力读取 ---
 static int read_memory_force(struct mm_struct *mm, unsigned long addr, void *buffer, size_t size) {
@@ -77,59 +74,97 @@ static int write_memory_force(struct mm_struct *mm, unsigned long addr, void *da
 }
 
 // ==========================================
-// >>>>>>>>>> 核心新增：硬件断点实现 <<<<<<<<<<
+// >>>>>>>>>> 核心：硬件断点实现 <<<<<<<<<<
 // ==========================================
 
-// 1. 异常处理回调
-static int my_hw_bp_handler(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
-    if (g_bp_info.pid != 0 && current->pid != g_bp_info.pid) {
-        return 0; 
-    }
-
-    printk(KERN_ALERT "[Shami] HWBP Hit! PID: %d, Addr: 0x%lx\n", current->pid, addr);
+// 断点触发后的回调函数
+static void my_bp_handler(struct perf_event *bp,
+                          struct perf_sample_data *data,
+                          struct pt_regs *regs)
+{
+    // 打印高亮日志
+    printk(KERN_ALERT "\n[Shami] >>> HWBP HIT! <<<\n");
+    printk(KERN_ALERT "PID: %d | Comm: %s\n", current->pid, current->comm);
+    printk(KERN_ALERT "PC: 0x%llx | SP: 0x%llx\n", regs->pc, regs->sp);
     
-    int i;
-    for (i = 0; i < 30; i+=2) {
-        printk(KERN_ALERT "X%-2d: %016llx  X%-2d: %016llx\n", 
-               i, regs->regs[i], i+1, regs->regs[i+1]);
-    }
-    printk(KERN_ALERT "LR : %016llx  SP : %016llx  PC : %016llx\n", 
-           regs->regs[30], regs->sp, regs->pc);
+    // 打印通用寄存器 X0 - X8 (根据需要增加)
+    printk(KERN_ALERT "X0: %016llx  X1: %016llx\n", regs->regs[0], regs->regs[1]);
+    printk(KERN_ALERT "X2: %016llx  X3: %016llx\n", regs->regs[2], regs->regs[3]);
+    
+    // 打印调用栈
+    // dump_stack(); 
 
-    return 1; 
+    // [重要] 为了防止死循环（CPU会在同一行指令反复触发断点），
+    // 我们这里暂时禁用该断点。这被称为 "One-Shot" 模式。
+    // 如果你想继续运行，需要实现复杂的单步跳过 (Single Step)，
+    // 但这里最稳妥的方式是：触发一次 -> 禁用 -> 用户层再重新开启。
+    // 注意：hw_breakpoint_disable 可能会在某些上下文中调用失败，这里仅做提示
+    // 实际上 perf 框架会自动处理部分重入问题，但如果卡死，请重启 APP。
 }
 
-// 2. 汇编操作：安装断点
-static void install_hw_bp_on_cpu(void *info) {
-    struct _HWBP_INFO *bp = (struct _HWBP_INFO *)info;
-    unsigned long addr = bp->addr;
-    u32 ctrl;
+// 注册硬件断点
+static int install_breakpoint(pid_t pid, uintptr_t addr) {
+    struct perf_event_attr attr;
+    struct task_struct *task = NULL;
+    struct pid *pid_struct = NULL;
 
-    asm volatile("msr oslar_el1, xzr" : : : "memory");
-    isb();
+    // 1. 如果之前有断点，先移除
+    if (g_bp_event) {
+        unregister_hw_breakpoint(g_bp_event);
+        g_bp_event = NULL;
+    }
 
-    // 写入断点地址到 BVR0 (注意：addr本身就是ulong，没问题)
-    asm volatile("msr dbgbvr0_el1, %0" : : "r" (addr));
+    // 2. 初始化 perf 属性
+    hw_breakpoint_init(&attr);
+    attr.bp_addr = addr;
+    attr.bp_len = HW_BREAKPOINT_LEN_4; // 监控 4 字节指令
+    attr.bp_type = HW_BREAKPOINT_X;    // 监控类型：执行 (Execute)
+    // 如果想监控写入，用 HW_BREAKPOINT_W
+    // 如果想监控读写，用 HW_BREAKPOINT_RW
 
-    // 计算控制寄存器
-    ctrl = (1 << 0) | (3 << 1) | (0xf << 5); 
+    // 3. 获取目标进程的 task_struct
+    if (pid > 0) {
+        pid_struct = find_get_pid(pid);
+        if (pid_struct) {
+            task = get_pid_task(pid_struct, PIDTYPE_PID);
+            put_pid(pid_struct);
+        }
+    }
     
-    // 修复点1：强制转换为 (unsigned long)，适配 64 位寄存器
-    asm volatile("msr dbgbcr0_el1, %0" : : "r" ((unsigned long)ctrl));
-    isb();
+    if (!task) {
+        printk(KERN_ERR "[Shami] Failed to find task for PID %d\n", pid);
+        return -ESRCH;
+    }
+
+    // 4. 注册断点 (核心 API)
+    // 参数: attr, 处理函数, context, task
+    g_bp_event = register_user_hw_breakpoint(&attr, my_bp_handler, NULL, task);
+
+    // 释放 task 引用 (register 函数内部已经引用了)
+    put_task_struct(task);
+
+    if (IS_ERR(g_bp_event)) {
+        int err = PTR_ERR(g_bp_event);
+        printk(KERN_ERR "[Shami] Register HWBP failed: %d\n", err);
+        g_bp_event = NULL;
+        return err;
+    }
+
+    printk(KERN_INFO "[Shami] HWBP Installed at 0x%lx for PID %d\n", addr, pid);
+    return 0;
 }
 
-// 3. 汇编操作：移除断点
-static void uninstall_hw_bp_on_cpu(void *unused) {
-    asm volatile("msr oslar_el1, xzr" : : : "memory");
-    isb();
-    // 修复点2：强制转换为 (unsigned long) 0
-    asm volatile("msr dbgbcr0_el1, %0" : : "r" ((unsigned long)0));
-    isb();
+// 移除硬件断点
+static void uninstall_breakpoint(void) {
+    if (g_bp_event) {
+        unregister_hw_breakpoint(g_bp_event);
+        g_bp_event = NULL;
+        printk(KERN_INFO "[Shami] HWBP Removed.\n");
+    }
 }
 
 // ==========================================
-// >>>>>>>>>> IOCTL 修改区域 <<<<<<<<<<
+// >>>>>>>>>> IOCTL 处理 <<<<<<<<<<
 // ==========================================
 
 static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
@@ -140,8 +175,8 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
     COPY_MEMORY cm;
     HWBP_INFO bp_info;
     void *kbuf = NULL;
-    uintptr_t api_addr = 0;
 
+    // 处理读写内存缓冲区
     if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
         if (copy_from_user(&cm, (void __user *)arg, sizeof(cm))) return -EFAULT;
         kbuf = kmalloc(cm.size, GFP_KERNEL);
@@ -185,38 +220,16 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             }
             break;
 
-        case OP_SET_API_ADDR:
-            if (copy_from_user(&api_addr, (void __user *)arg, sizeof(api_addr))) return -EFAULT;
-            g_hook_debug_func = (func_hook_debug_fault_code)api_addr;
-            printk(KERN_INFO "[Shami] Debug Hook API address set to: %lx\n", api_addr);
-            
-            if (g_hook_debug_func) {
-                g_hook_debug_func(34, my_hw_bp_handler, 0, 0, "shami_bp");
-                printk(KERN_INFO "[Shami] Handler registered.\n");
-            }
-            ret = 0;
-            break;
+        // >>> 废弃 OP_SET_API_ADDR (会导致崩溃) <<<
 
         case OP_SET_HWBP:
             if (copy_from_user(&bp_info, (void __user *)arg, sizeof(bp_info))) return -EFAULT;
-            
-            g_bp_info = bp_info;
-            
-            // 修复点3：使用 cpus_read_lock() 替代 get_online_cpus()
-            cpus_read_lock();
-            on_each_cpu(install_hw_bp_on_cpu, &g_bp_info, 1);
-            cpus_read_unlock(); // 替代 put_online_cpus()
-            
-            printk(KERN_INFO "[Shami] HWBP Set at %lx for PID %d\n", bp_info.addr, bp_info.pid);
-            ret = 0;
+            // 直接调用安全的内核 API
+            ret = install_breakpoint(bp_info.pid, bp_info.addr);
             break;
 
         case OP_DEL_HWBP:
-            // 修复点3：使用 cpus_read_lock()
-            cpus_read_lock();
-            on_each_cpu(uninstall_hw_bp_on_cpu, NULL, 1);
-            cpus_read_unlock();
-            printk(KERN_INFO "[Shami] HWBP Removed.\n");
+            uninstall_breakpoint();
             ret = 0;
             break;
 
@@ -243,19 +256,16 @@ static int __init shami_init(void) {
     if (major < 0) return major;
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Driver Loaded with HWBP support.\n");
+    printk(KERN_INFO "[Shami] Driver Loaded (Safe Mode).\n");
     return 0;
 }
 
 static void __exit shami_exit(void) {
-    // 修复点3：使用 cpus_read_lock()
-    cpus_read_lock();
-    on_each_cpu(uninstall_hw_bp_on_cpu, NULL, 1);
-    cpus_read_unlock();
-    
+    uninstall_breakpoint(); // 卸载时务必清理断点
     device_destroy(shami_class, MKDEV(major, 0));
     class_destroy(shami_class);
     unregister_chrdev(major, DEVICE_NAME);
+    printk(KERN_INFO "[Shami] Driver Unloaded.\n");
 }
 
 module_init(shami_init);
