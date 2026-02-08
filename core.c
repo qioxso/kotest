@@ -20,12 +20,13 @@
 // 全局变量
 static pid_t g_target_pid = 0;
 static uintptr_t g_target_addr = 0;
-static uint32_t g_orig_insn = 0;
+// static uint32_t g_orig_insn = 0; // 不再需要还原，注释掉
 static bool g_kprobe_registered = false;
 
 // ==========================================
 // >>>>>>>>>> GUP 内存读写 <<<<<<<<<<
 // ==========================================
+// 仅供 IOCTL 使用 (进程上下文)，Kprobe 中严禁调用！
 
 static int read_memory_force(struct mm_struct *mm, unsigned long addr, void *buffer, size_t size) {
     struct page *page;
@@ -97,25 +98,26 @@ static int handler_debug_exception(struct kprobe *p, struct pt_regs *kregs)
     // 用户态 PC 此时应该停在 BRK 指令上
     if (user_regs->pc == g_target_addr) {
         
-        printk(KERN_ALERT "\n[Shami] >>> SWBP HIT! Intercepted do_debug_exception <<<\n");
+        printk(KERN_ALERT "\n[Shami] >>> SWBP HIT! (Skip Instruction) <<<\n");
         
         // 打印寄存器
         printk(KERN_ALERT "PC: %016llx  SP: %016llx\n", user_regs->pc, user_regs->sp);
         printk(KERN_ALERT "X0: %016llx  X1: %016llx\n", user_regs->regs[0], user_regs->regs[1]);
         printk(KERN_ALERT "X2: %016llx  X3: %016llx\n", user_regs->regs[2], user_regs->regs[3]);
         printk(KERN_ALERT "X4: %016llx  X5: %016llx\n", user_regs->regs[4], user_regs->regs[5]);
+        // 打印 LR (返回地址)
         printk(KERN_ALERT "LR: %016llx\n", user_regs->regs[30]);
 
-        // 4. 还原指令
-        if (g_orig_insn != 0) {
-            write_memory_force(current->mm, g_target_addr, &g_orig_insn, 4);
-            printk(KERN_ALERT "[Shami] Instruction restored: %08x\n", g_orig_insn);
-        }
+        // 4. [修改] 不要还原指令，因为写内存会导致重启！
+        // if (g_orig_insn != 0) { ... } // 删掉或注释掉
 
-        // 5. [魔法] 跳过 do_debug_exception
-        // 我们不想让内核继续处理这个异常（否则它会发现是 BRK 并发信号）
-        // 我们直接让 do_debug_exception 返回 void
-        // 方法：将内核 PC 设置为 LR (返回地址)
+        // 5. [核心修复] 跳过当前指令
+        // BRK 指令长度是 4 字节。我们让 PC + 4，直接跳过它。
+        // 这样 CPU 就不会再次执行这条 BRK，也就不会死循环。
+        user_regs->pc += 4;
+
+        // 6. [魔法] 跳过 do_debug_exception 本身
+        // 将内核 PC 设置为 LR (返回地址)，让内核函数直接返回
         instruction_pointer_set(kregs, kregs->regs[30]);
 
         return 1; // Skip original function
@@ -190,9 +192,9 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             
             g_target_pid = bp_info.pid;
             g_target_addr = bp_info.addr;
-            g_orig_insn = bp_info.orig_instruction;
+            // g_orig_insn = bp_info.orig_instruction; // 不需要还原了
 
-            // 1. 注册 Kprobe (Hook 异常入口)
+            // 1. 注册 Kprobe
             if (!g_kprobe_registered) {
                 int err = register_kprobe(&kp);
                 if (err < 0) {
@@ -200,10 +202,10 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
                     return err;
                 }
                 g_kprobe_registered = true;
-                printk(KERN_INFO "[Shami] Hooked do_debug_exception.\n");
+                printk(KERN_INFO "[Shami] Hooked do_debug_exception (Skip Mode).\n");
             }
 
-            // 2. 写入 BRK
+            // 2. 写入 BRK (这里是安全的，因为是在 ioctl 进程上下文中)
             pid_struct = find_get_pid(g_target_pid);
             if (pid_struct) {
                 task = get_pid_task(pid_struct, PIDTYPE_PID);
@@ -256,7 +258,7 @@ static int __init shami_init(void) {
     if (major < 0) return major;
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Driver Loaded (Hook do_debug_exception).\n");
+    printk(KERN_INFO "[Shami] Driver Loaded (Skip Instruction Mode).\n");
     return 0;
 }
 
