@@ -21,7 +21,7 @@
 static pid_t g_target_pid = 0;
 static uintptr_t g_target_addr = 0;
 static uint32_t g_orig_insn = 0;
-static bool g_kprobe_registered = false;
+static bool g_kprobes_registered = false;
 
 // ==========================================
 // >>>>>>>>>> GUP 内存读写 <<<<<<<<<<
@@ -73,48 +73,50 @@ static int write_memory_force(struct mm_struct *mm, unsigned long addr, void *da
 }
 
 // ==========================================
-// >>>>>>>>>> Kprobe 拦截逻辑 (修正版) <<<<<<<<<<
+// >>>>>>>>>> 通用 Hook 处理逻辑 <<<<<<<<<<
 // ==========================================
 
-// 目标函数: send_sig_fault(int sig, int code, void __user *addr, ...)
-// 寄存器参数: X0=sig, X1=code, X2=addr
-static int my_kprobe_pre_handler(struct kprobe *p, struct pt_regs *regs)
+// 这是一个通用的处理函数，不管 Hook 到了哪个内核函数，都调用这个
+static int common_handler(struct pt_regs *regs, const char* hook_name)
 {
-    int sig = regs->regs[0];        // X0: 信号
-    uintptr_t fault_addr = regs->regs[2]; // X2: 故障地址
+    // 在 arm64 调用约定中，X2 通常是第三个参数。
+    // arm64_force_sig_fault(sig, code, addr, ...) -> X2 是 addr
+    // force_sig_ptrace_errno_trap(errno, addr)     -> X1 是 addr (注意!)
+    
+    uintptr_t x1_val = regs->regs[1];
+    uintptr_t x2_val = regs->regs[2];
 
     // 1. 检查进程
     if (g_target_pid == 0 || current->tgid != g_target_pid) {
         return 0; 
     }
 
-    // 2. 检查信号 (SIGTRAP=5) 和 地址
-    // 注意：send_sig_fault 是非常底层的函数，一定要匹配地址，防止拦截错误
-    if (sig == 5 && fault_addr == g_target_addr) {
+    // 2. 检查地址匹配
+    // 因为不同函数参数位置不一样，我们两个寄存器都检查一下，
+    // 只要有一个等于我们的断点地址，就认为是命中了。
+    bool hit = false;
+    if (x2_val == g_target_addr) hit = true;
+    else if (x1_val == g_target_addr) hit = true;
+
+    if (hit) {
+        printk(KERN_ALERT "\n[Shami] >>> SWBP HIT! Intercepted by %s <<<\n", hook_name);
         
-        printk(KERN_ALERT "\n[Shami] >>> SWBP HIT! Intercepted send_sig_fault <<<\n");
-        
-        // 获取用户态崩溃时的寄存器
+        // 获取用户态寄存器
         struct pt_regs *user_regs = task_pt_regs(current);
         if (user_regs) {
             printk(KERN_ALERT "PC: %016llx  SP: %016llx\n", user_regs->pc, user_regs->sp);
-            // 打印参数 X0-X8
             printk(KERN_ALERT "X0: %016llx  X1: %016llx\n", user_regs->regs[0], user_regs->regs[1]);
             printk(KERN_ALERT "X2: %016llx  X3: %016llx\n", user_regs->regs[2], user_regs->regs[3]);
-            printk(KERN_ALERT "X4: %016llx  X5: %016llx\n", user_regs->regs[4], user_regs->regs[5]);
-            printk(KERN_ALERT "X6: %016llx  X7: %016llx\n", user_regs->regs[6], user_regs->regs[7]);
         }
 
         // 3. 还原指令
         if (g_orig_insn != 0) {
-            // 还原为原始指令
             write_memory_force(current->mm, g_target_addr, &g_orig_insn, 4);
-            printk(KERN_ALERT "[Shami] Instruction restored: %x\n", g_orig_insn);
+            printk(KERN_ALERT "[Shami] Instruction restored.\n");
         }
 
-        // 4. [魔法] 跳过原函数执行
-        // 将 PC 设置为 LR (返回地址)，直接从 send_sig_fault 返回
-        instruction_pointer_set(regs, regs->regs[30]);
+        // 4. [魔法] 跳过原函数，直接返回
+        instruction_pointer_set(regs, regs->regs[30]); // PC = LR
 
         return 1; // Skip execution
     }
@@ -122,10 +124,24 @@ static int my_kprobe_pre_handler(struct kprobe *p, struct pt_regs *regs)
     return 0;
 }
 
-static struct kprobe kp = {
-    // [修改点] 改为 send_sig_fault，这是更底层的函数
-    .symbol_name = "send_sig_fault", 
-    .pre_handler = my_kprobe_pre_handler,
+// Hook 1: arm64_force_sig_fault
+static int handler_arm64_force(struct kprobe *p, struct pt_regs *regs) {
+    return common_handler(regs, "arm64_force_sig_fault");
+}
+
+// Hook 2: force_sig_ptrace_errno_trap (专门处理 ptrace/brkpt 的)
+static int handler_ptrace_trap(struct kprobe *p, struct pt_regs *regs) {
+    return common_handler(regs, "force_sig_ptrace_errno_trap");
+}
+
+static struct kprobe kp1 = {
+    .symbol_name = "arm64_force_sig_fault",
+    .pre_handler = handler_arm64_force,
+};
+
+static struct kprobe kp2 = {
+    .symbol_name = "force_sig_ptrace_errno_trap",
+    .pre_handler = handler_ptrace_trap,
 };
 
 // ==========================================
@@ -191,20 +207,17 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             g_target_addr = bp_info.addr;
             g_orig_insn = bp_info.orig_instruction;
 
-            // 1. 注册 Kprobe (如果之前没注册)
-            if (!g_kprobe_registered) {
-                int err = register_kprobe(&kp);
-                if (err < 0) {
-                    printk(KERN_ERR "[Shami] Failed to hook send_sig_fault: %d\n", err);
-                    
-                    // [备选方案] 如果 send_sig_fault 也不行，尝试 arm64_force_sig_fault
-                    // printk(KERN_INFO "[Shami] Trying arm64_force_sig_fault...\n");
-                    // kp.symbol_name = "arm64_force_sig_fault";
-                    // register_kprobe(&kp);
-                    return err;
-                }
-                g_kprobe_registered = true;
-                printk(KERN_INFO "[Shami] Kprobe hooked on: %s\n", kp.symbol_name);
+            // 1. 注册双重 Kprobe
+            if (!g_kprobes_registered) {
+                int err1 = register_kprobe(&kp1);
+                if (err1 < 0) printk(KERN_ERR "[Shami] Hook kp1 failed: %d\n", err1);
+                else printk(KERN_INFO "[Shami] Hook kp1 success.\n");
+
+                int err2 = register_kprobe(&kp2);
+                if (err2 < 0) printk(KERN_ERR "[Shami] Hook kp2 failed: %d\n", err2);
+                else printk(KERN_INFO "[Shami] Hook kp2 success.\n");
+
+                g_kprobes_registered = true;
             }
 
             // 2. 写入 BRK
@@ -229,10 +242,11 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             break;
 
         case OP_DEL_SWBP:
-            if (g_kprobe_registered) {
-                unregister_kprobe(&kp);
-                g_kprobe_registered = false;
-                printk(KERN_INFO "[Shami] Kprobe removed.\n");
+            if (g_kprobes_registered) {
+                unregister_kprobe(&kp1);
+                unregister_kprobe(&kp2);
+                g_kprobes_registered = false;
+                printk(KERN_INFO "[Shami] Kprobes removed.\n");
             }
             ret = 0;
             break;
@@ -260,12 +274,15 @@ static int __init shami_init(void) {
     if (major < 0) return major;
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Driver Loaded (Hook: send_sig_fault).\n");
+    printk(KERN_INFO "[Shami] Driver Loaded (Dual-Hook).\n");
     return 0;
 }
 
 static void __exit shami_exit(void) {
-    if (g_kprobe_registered) unregister_kprobe(&kp);
+    if (g_kprobes_registered) {
+        unregister_kprobe(&kp1);
+        unregister_kprobe(&kp2);
+    }
     device_destroy(shami_class, MKDEV(major, 0));
     class_destroy(shami_class);
     unregister_chrdev(major, DEVICE_NAME);
