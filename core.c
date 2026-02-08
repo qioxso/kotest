@@ -8,25 +8,24 @@
 #include <linux/mm.h>
 #include <linux/highmem.h>
 #include <linux/sched/mm.h>
-#include <linux/version.h>
 #include <linux/pid.h>
 #include <linux/cpu.h>
-#include <linux/hw_breakpoint.h>
-#include <linux/perf_event.h>
+#include <linux/kallsyms.h>
+// 我们不再用 linux/hw_breakpoint.h，因为我们要手动操作
+#include <asm/debug-monitors.h> 
 
 #include "comm.h"
 
 #define DEVICE_NAME "shami"
 
-// 保存 CPU 全局断点的指针 (每个 CPU 一个)
-static struct perf_event * __percpu *g_bp_events = NULL;
-// 全局过滤 PID
-static pid_t g_target_pid = 0; 
+// 全局变量
+static pid_t g_target_pid = 0;
+static uintptr_t g_target_addr = 0;
+static bool g_bp_installed = false;
 
 // ==========================================
-// >>>>>>>>>> GUP 内存读写辅助函数 <<<<<<<<<<
+// >>>>>>>>>> GUP (必须保留) <<<<<<<<<<
 // ==========================================
-
 static int read_memory_force(struct mm_struct *mm, unsigned long addr, void *buffer, size_t size) {
     struct page *page;
     void *maddr;
@@ -76,82 +75,59 @@ static int write_memory_force(struct mm_struct *mm, unsigned long addr, void *da
 }
 
 // ==========================================
-// >>>>>>>>>> 核心：强力抢占断点 <<<<<<<<<<
+// >>>>>>>>>> 核心：暴力汇编操作 <<<<<<<<<<
 // ==========================================
 
-// 断点触发回调
-static void my_bp_handler(struct perf_event *bp,
-                          struct perf_sample_data *data,
-                          struct pt_regs *regs)
-{
-    // 过滤器：如果不是目标进程，直接返回
-    if (g_target_pid != 0 && current->tgid != g_target_pid) {
-        return; 
-    }
+// 在当前 CPU 上强行安装
+static void install_force_on_cpu(void *info) {
+    unsigned long addr = g_target_addr;
+    u32 ctrl;
 
-    printk(KERN_ALERT "\n[Shami] >>> HIT! PID: %d (Comm: %s) <<<\n", current->tgid, current->comm);
-    printk(KERN_ALERT "PC: 0x%llx | LR: 0x%llx | SP: 0x%llx\n", regs->pc, regs->regs[30], regs->sp);
-    printk(KERN_ALERT "X0: %016llx  X1: %016llx\n", regs->regs[0], regs->regs[1]);
-    printk(KERN_ALERT "X2: %016llx  X3: %016llx\n", regs->regs[2], regs->regs[3]);
+    // 1. 解锁 OSLAR (允许写调试寄存器)
+    asm volatile("msr oslar_el1, xzr" : : : "memory");
+    isb();
+
+    // 2. [核弹操作] 暴力关闭所有槽位 (0-5)
+    // 既然系统占满了，我们就全部关掉，腾出位置
+    // 注意：这可能会导致系统自带的性能监控失效，但为了调试只能这样
+    asm volatile("msr dbgbcr0_el1, %0" : : "r" (0UL));
+    asm volatile("msr dbgbcr1_el1, %0" : : "r" (0UL));
+    asm volatile("msr dbgbcr2_el1, %0" : : "r" (0UL));
+    asm volatile("msr dbgbcr3_el1, %0" : : "r" (0UL));
+    asm volatile("msr dbgbcr4_el1, %0" : : "r" (0UL));
+    asm volatile("msr dbgbcr5_el1, %0" : : "r" (0UL));
+    isb();
+
+    // 3. 强行写入 Slot 0
+    asm volatile("msr dbgbvr0_el1, %0" : : "r" (addr));
     
-    // [修复点] 使用 perf_event_disable 替代 hw_breakpoint_disable (5.10内核专用)
-    perf_event_disable(bp);
+    // 配置控制位: Enable=1, EL0=1(User), Type=EXEC
+    // 0x1 (Enable) | 0x2 (EL0 only) | 0x1E0 (Byte select 0xF << 5)
+    ctrl = (1 << 0) | (1 << 1) | (0xf << 5); 
     
-    printk(KERN_ALERT "[Shami] Breakpoint disabled to prevent loop.\n");
+    asm volatile("msr dbgbcr0_el1, %0" : : "r" ((unsigned long)ctrl));
+    isb();
 }
 
-// 移除全局断点 (前置声明或调整位置，确保在 install 中调用前已定义)
-static void uninstall_wide_breakpoint(void) {
-    if (g_bp_events) {
-        unregister_wide_hw_breakpoint(g_bp_events);
-        g_bp_events = NULL;
-        printk(KERN_INFO "[Shami] HWBP Removed.\n");
-    }
+// 在当前 CPU 上强行卸载
+static void uninstall_force_on_cpu(void *info) {
+    asm volatile("msr oslar_el1, xzr" : : : "memory");
+    isb();
+    // 仅关闭 Slot 0
+    asm volatile("msr dbgbcr0_el1, %0" : : "r" (0UL));
+    isb();
 }
 
-// 安装全局断点 (带 Pinned 和 Exclude Kernel 属性)
-static int install_wide_breakpoint(pid_t pid, uintptr_t addr) {
-    struct perf_event_attr attr;
-    int err;
-
-    // 1. 如果已有断点，先移除
-    if (g_bp_events) {
-        uninstall_wide_breakpoint();
-    }
-
-    g_target_pid = pid;
-
-    // 2. 初始化属性
-    hw_breakpoint_init(&attr);
-    attr.bp_addr = addr;
-    attr.bp_len = HW_BREAKPOINT_LEN_4;
-    attr.bp_type = HW_BREAKPOINT_X;
-    
-    // >>> 关键修改点: 强占模式 + 用户态优化 <<<
-    attr.pinned = 1;     // 必须驻留 (High Priority)
-    attr.exclusive = 1;  // 独占模式
-    
-    // [新加优化] 只监控用户态。这可以极大减少资源冲突，
-    // 因为很多系统监控只关心内核态或全局，我们避开它们。
-    attr.exclude_kernel = 1; 
-    attr.exclude_hv = 1; 
-
-    // 3. 注册全局断点
-    g_bp_events = register_wide_hw_breakpoint(&attr, my_bp_handler, NULL);
-
-    if (IS_ERR((void __force *)g_bp_events)) {
-        err = PTR_ERR((void __force *)g_bp_events);
-        printk(KERN_ERR "[Shami] Failed to install HWBP: %d\n", err);
-        g_bp_events = NULL;
-        return err;
-    }
-
-    printk(KERN_INFO "[Shami] PINNED HWBP Installed at 0x%lx (User-Mode Only)\n", addr);
-    return 0;
-}
+// 简单的异常处理 (需要配合 register_debug_fault_handler)
+// 如果找不到内核符号，这一步是最大的难点。
+// 我们先通过“写寄存器不报错”来验证是否能断下来。
+// 为了能收到断点，我们需要注册 hook。
+// 如果你之前 hook 崩溃了，我们这里先不注册 hook，
+// 而是看系统日志会不会报 "Unhandled Debug Exception"
+// 只要报了这个错，就说明断点生效了！
 
 // ==========================================
-// >>>>>>>>>> IOCTL 处理逻辑 <<<<<<<<<<
+// >>>>>>>>>> IOCTL <<<<<<<<<<
 // ==========================================
 
 static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
@@ -170,7 +146,7 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
     }
 
     switch (cmd) {
-        case OP_READ_MEM: 
+         case OP_READ_MEM: 
             pid_struct = find_get_pid(cm.pid);
             if (pid_struct) {
                 task = get_pid_task(pid_struct, PIDTYPE_PID);
@@ -208,11 +184,27 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
 
         case OP_SET_HWBP:
             if (copy_from_user(&bp_info, (void __user *)arg, sizeof(bp_info))) return -EFAULT;
-            ret = install_wide_breakpoint(bp_info.pid, bp_info.addr);
+            
+            g_target_pid = bp_info.pid;
+            g_target_addr = bp_info.addr;
+            g_bp_installed = true;
+
+            // 在所有 CPU 上执行暴力写入
+            // cpus_read_lock / unlock 是 5.10 的 API
+            cpus_read_lock();
+            on_each_cpu(install_force_on_cpu, NULL, 1);
+            cpus_read_unlock();
+            
+            printk(KERN_ALERT "[Shami] FORCE INSTALLED HWBP at 0x%lx\n", g_target_addr);
+            ret = 0;
             break;
 
         case OP_DEL_HWBP:
-            uninstall_wide_breakpoint();
+            g_bp_installed = false;
+            cpus_read_lock();
+            on_each_cpu(uninstall_force_on_cpu, NULL, 1);
+            cpus_read_unlock();
+            printk(KERN_ALERT "[Shami] FORCE REMOVED HWBP\n");
             ret = 0;
             break;
 
@@ -225,6 +217,7 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
     return ret;
 }
 
+// ... 驱动注册部分保持不变 ...
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .unlocked_ioctl = shami_ioctl,
@@ -239,16 +232,19 @@ static int __init shami_init(void) {
     if (major < 0) return major;
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Driver Loaded (Pinned/User-Mode).\n");
+    printk(KERN_INFO "[Shami] Driver Loaded (NUCLEAR MODE).\n");
     return 0;
 }
 
 static void __exit shami_exit(void) {
-    uninstall_wide_breakpoint();
+    // 卸载前清理
+    cpus_read_lock();
+    on_each_cpu(uninstall_force_on_cpu, NULL, 1);
+    cpus_read_unlock();
+    
     device_destroy(shami_class, MKDEV(major, 0));
     class_destroy(shami_class);
     unregister_chrdev(major, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Driver Unloaded.\n");
 }
 
 module_init(shami_init);
