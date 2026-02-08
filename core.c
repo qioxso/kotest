@@ -89,14 +89,17 @@ static DEFINE_MUTEX(uprobe_lock);
 
 // 断点触发时的回调函数
 // 注意：该函数在中断上下文中运行，不要执行休眠操作
+// core.c 中修改这个函数
 static int my_uprobe_handler(struct uprobe_consumer *con, struct pt_regs *regs) {
     struct my_uprobe_ctx *ctx = container_of(con, struct my_uprobe_ctx, consumer);
     
-    printk(KERN_INFO "[Shami] Uprobe HIT! PID: %d, VAddr: 0x%lx\n", current->pid, ctx->vaddr);
-    printk(KERN_INFO "[Shami] REGS - IP: 0x%lx, SP: 0x%lx, AX: 0x%lx\n", 
-           regs->ip, regs->sp, regs->ax);
+    // --- ARM64 适配修改 ---
+    printk(KERN_INFO "[Shami] Uprobe HIT! PID: %d, VAddr: 0x%lx\n", ctx->pid, ctx->vaddr);
+    // x86: regs->ip, regs->ax
+    // ARM64: regs->pc (Program Counter), regs->regs[0] (也就是 x0 寄存器，通常是返回值或第一个参数)
+    printk(KERN_INFO "[Shami] REGS - PC: 0x%llx, SP: 0x%llx, X0: 0x%llx\n", 
+           regs->pc, regs->sp, regs->regs[0]);
     
-    // 返回 0 表示继续执行
     return 0;
 }
 
