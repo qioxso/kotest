@@ -1,3 +1,4 @@
+// core.c
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -8,151 +9,255 @@
 #include <linux/mm.h>
 #include <linux/highmem.h>
 #include <linux/sched/mm.h>
+#include <linux/version.h>
 #include <linux/pid.h>
-#include <linux/cpu.h>
-#include <linux/ptrace.h>
-#include <linux/kprobes.h> 
+#include <linux/namei.h>
+#include <linux/path.h>
+#include <linux/mount.h>
+// 引入 Uprobes 头文件
+#include <linux/uprobes.h>
 
 #include "comm.h"
 
 #define DEVICE_NAME "shami"
 
-// 全局变量
-static pid_t g_target_pid = 0;
-static uintptr_t g_target_addr = 0;
-// static uint32_t g_orig_insn = 0; // 不再需要还原，注释掉
-static bool g_kprobe_registered = false;
-
-// ==========================================
-// >>>>>>>>>> GUP 内存读写 <<<<<<<<<<
-// ==========================================
-// 仅供 IOCTL 使用 (进程上下文)，Kprobe 中严禁调用！
-
+// --- 辅助函数：GUP 强力读取 ---
 static int read_memory_force(struct mm_struct *mm, unsigned long addr, void *buffer, size_t size) {
     struct page *page;
     void *maddr;
     int res;
     size_t bytes_read = 0;
     
-    mmap_read_lock(mm);
     while (bytes_read < size) {
         size_t offset = (addr + bytes_read) & ~PAGE_MASK;
         size_t bytes_to_copy = min(size - bytes_read, PAGE_SIZE - offset);
+
         res = get_user_pages_remote(mm, addr + bytes_read, 1, FOLL_FORCE, &page, NULL, NULL);
-        if (res <= 0) { mmap_read_unlock(mm); return -1; }
+        if (res <= 0) return -1;
+
         maddr = kmap_atomic(page);
         memcpy(buffer + bytes_read, maddr + offset, bytes_to_copy);
         kunmap_atomic(maddr);
+        
         put_page(page);
         bytes_read += bytes_to_copy;
     }
-    mmap_read_unlock(mm);
     return 0;
 }
 
+// --- 辅助函数：GUP 强力写入 ---
 static int write_memory_force(struct mm_struct *mm, unsigned long addr, void *data, size_t size) {
     struct page *page;
     void *maddr;
     int res;
     size_t bytes_written = 0;
 
-    mmap_read_lock(mm);
     while (bytes_written < size) {
         size_t offset = (addr + bytes_written) & ~PAGE_MASK;
         size_t bytes_to_copy = min(size - bytes_written, PAGE_SIZE - offset);
+
         res = get_user_pages_remote(mm, addr + bytes_written, 1, FOLL_WRITE | FOLL_FORCE, &page, NULL, NULL);
-        if (res <= 0) { mmap_read_unlock(mm); return -1; }
+        if (res <= 0) return -1;
+
         maddr = kmap_atomic(page);
         memcpy(maddr + offset, data + bytes_written, bytes_to_copy);
         kunmap_atomic(maddr);
+        
         set_page_dirty_lock(page);
         put_page(page);
         bytes_written += bytes_to_copy;
     }
-    mmap_read_unlock(mm);
     return 0;
 }
 
-// ==========================================
-// >>>>>>>>>> Kprobe 拦截 do_debug_exception <<<<<<<<<<
-// ==========================================
+// ---------------------------------------------------------
+// --- Uprobes 相关功能 ---
+// ---------------------------------------------------------
 
-// 函数原型：
-// void do_debug_exception(unsigned long addr_if_watchpoint, unsigned int esr, struct pt_regs *regs)
-// 参数寄存器: X0=addr, X1=esr, X2=regs(用户态寄存器指针)
-static int handler_debug_exception(struct kprobe *p, struct pt_regs *kregs)
-{
-    // 1. 检查进程
-    if (g_target_pid == 0 || current->tgid != g_target_pid) {
-        return 0; 
-    }
-
-    // 2. 获取 do_debug_exception 的第三个参数 (X2)
-    // 这个参数是指向用户态寄存器组 (struct pt_regs) 的指针
-    struct pt_regs *user_regs = (struct pt_regs *)kregs->regs[2];
-    
-    // 安全检查：指针是否有效
-    if (!user_regs) return 0;
-
-    // 3. 检查断点地址
-    // 用户态 PC 此时应该停在 BRK 指令上
-    if (user_regs->pc == g_target_addr) {
-        
-        printk(KERN_ALERT "\n[Shami] >>> SWBP HIT! (Skip Instruction) <<<\n");
-        
-        // 打印寄存器
-        printk(KERN_ALERT "PC: %016llx  SP: %016llx\n", user_regs->pc, user_regs->sp);
-        printk(KERN_ALERT "X0: %016llx  X1: %016llx\n", user_regs->regs[0], user_regs->regs[1]);
-        printk(KERN_ALERT "X2: %016llx  X3: %016llx\n", user_regs->regs[2], user_regs->regs[3]);
-        printk(KERN_ALERT "X4: %016llx  X5: %016llx\n", user_regs->regs[4], user_regs->regs[5]);
-        // 打印 LR (返回地址)
-        printk(KERN_ALERT "LR: %016llx\n", user_regs->regs[30]);
-
-        // 4. [修改] 不要还原指令，因为写内存会导致重启！
-        // if (g_orig_insn != 0) { ... } // 删掉或注释掉
-
-        // 5. [核心修复] 跳过当前指令
-        // BRK 指令长度是 4 字节。我们让 PC + 4，直接跳过它。
-        // 这样 CPU 就不会再次执行这条 BRK，也就不会死循环。
-        user_regs->pc += 4;
-
-        // 6. [魔法] 跳过 do_debug_exception 本身
-        // 将内核 PC 设置为 LR (返回地址)，让内核函数直接返回
-        instruction_pointer_set(kregs, kregs->regs[30]);
-
-        return 1; // Skip original function
-    }
-
-    return 0;
-}
-
-static struct kprobe kp = {
-    .symbol_name = "do_debug_exception",
-    .pre_handler = handler_debug_exception,
+// 定义我们自己的 Uprobe 节点，用于链表管理
+struct my_uprobe_ctx {
+    struct list_head list;
+    struct uprobe_consumer consumer;
+    struct inode *inode;
+    loff_t offset;
+    unsigned long vaddr; // 记录原始虚拟地址方便查找
+    pid_t pid;           // 记录PID
 };
 
-// ==========================================
-// >>>>>>>>>> IOCTL <<<<<<<<<<
-// ==========================================
+static LIST_HEAD(uprobe_list);
+static DEFINE_MUTEX(uprobe_lock);
 
+// 断点触发时的回调函数
+// 注意：该函数在中断上下文中运行，不要执行休眠操作
+static int my_uprobe_handler(struct uprobe_consumer *con, struct pt_regs *regs) {
+    struct my_uprobe_ctx *ctx = container_of(con, struct my_uprobe_ctx, consumer);
+    
+    printk(KERN_INFO "[Shami] Uprobe HIT! PID: %d, VAddr: 0x%lx\n", current->pid, ctx->vaddr);
+    printk(KERN_INFO "[Shami] REGS - IP: 0x%lx, SP: 0x%lx, AX: 0x%lx\n", 
+           regs->ip, regs->sp, regs->ax);
+    
+    // 返回 0 表示继续执行
+    return 0;
+}
+
+// 辅助：根据 PID 和 虚拟地址 查找对应的 Inode 和 Offset
+// Uprobes 必须注册在 (inode, offset) 上，而不是虚拟地址上
+static int resolve_addr_to_inode_offset(pid_t pid, unsigned long vaddr, struct inode **out_inode, loff_t *out_offset) {
+    struct task_struct *task;
+    struct pid *pid_struct;
+    struct mm_struct *mm;
+    struct vm_area_struct *vma;
+    struct file *vma_file;
+    int ret = -EINVAL;
+
+    pid_struct = find_get_pid(pid);
+    if (!pid_struct) return -ESRCH;
+
+    task = get_pid_task(pid_struct, PIDTYPE_PID);
+    if (!task) {
+        put_pid(pid_struct);
+        return -ESRCH;
+    }
+
+    mm = get_task_mm(task);
+    if (!mm) {
+        put_task_struct(task);
+        put_pid(pid_struct);
+        return -EINVAL;
+    }
+
+    // 必须要持有 mmap锁 才能遍历 vma
+    mmap_read_lock(mm);
+    
+    vma = find_vma(mm, vaddr);
+    if (vma && vma->vm_start <= vaddr && vma->vm_file) {
+        vma_file = vma->vm_file;
+        *out_inode = file_inode(vma_file);
+        
+        // 增加 inode 引用计数，防止文件被关闭后 inode 消失
+        ihold(*out_inode);
+        
+        // 计算文件内的偏移量
+        // Offset = (Addr - VMA_Start) + (VMA_Page_Offset << PAGE_SHIFT)
+        *out_offset = (vaddr - vma->vm_start) + (vma->vm_pgoff << PAGE_SHIFT);
+        ret = 0;
+    } else {
+        // 地址无效或该内存区域不是文件映射（如堆栈/堆）
+        // Uprobes 只能用于文件映射的代码段
+        ret = -EFAULT;
+    }
+
+    mmap_read_unlock(mm);
+    mmput(mm);
+    put_task_struct(task);
+    put_pid(pid_struct);
+    
+    return ret;
+}
+
+static int add_uprobe(pid_t pid, unsigned long vaddr) {
+    struct my_uprobe_ctx *ctx;
+    struct inode *inode = NULL;
+    loff_t offset = 0;
+    int ret;
+
+    // 1. 解析地址
+    ret = resolve_addr_to_inode_offset(pid, vaddr, &inode, &offset);
+    if (ret) return ret;
+
+    // 2. 分配上下文
+    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+    if (!ctx) {
+        iput(inode);
+        return -ENOMEM;
+    }
+
+    // 3. 填充 consumer
+    ctx->consumer.handler = my_uprobe_handler;
+    ctx->inode = inode;
+    ctx->offset = offset;
+    ctx->vaddr = vaddr;
+    ctx->pid = pid;
+
+    // 4. 注册 Uprobe
+    ret = uprobe_register(inode, offset, &ctx->consumer);
+    if (ret) {
+        printk(KERN_ERR "[Shami] uprobe_register failed: %d\n", ret);
+        iput(inode);
+        kfree(ctx);
+        return ret;
+    }
+
+    // 5. 加入链表
+    mutex_lock(&uprobe_lock);
+    list_add(&ctx->list, &uprobe_list);
+    mutex_unlock(&uprobe_lock);
+
+    printk(KERN_INFO "[Shami] Uprobe added at PID %d, Addr 0x%lx (Inode %lu, Off 0x%llx)\n", 
+           pid, vaddr, inode->i_ino, offset);
+    
+    return 0;
+}
+
+static int del_uprobe(pid_t pid, unsigned long vaddr) {
+    struct my_uprobe_ctx *ctx, *tmp;
+    int found = 0;
+
+    mutex_lock(&uprobe_lock);
+    list_for_each_entry_safe(ctx, tmp, &uprobe_list, list) {
+        if (ctx->pid == pid && ctx->vaddr == vaddr) {
+            uprobe_unregister(ctx->inode, ctx->offset, &ctx->consumer);
+            iput(ctx->inode); // 释放 inode 引用
+            list_del(&ctx->list);
+            kfree(ctx);
+            found = 1;
+            break; // 假设同一地址只下一次
+        }
+    }
+    mutex_unlock(&uprobe_lock);
+
+    return found ? 0 : -ENOENT;
+}
+
+static void clean_all_uprobes(void) {
+    struct my_uprobe_ctx *ctx, *tmp;
+    
+    mutex_lock(&uprobe_lock);
+    list_for_each_entry_safe(ctx, tmp, &uprobe_list, list) {
+        uprobe_unregister(ctx->inode, ctx->offset, &ctx->consumer);
+        iput(ctx->inode);
+        list_del(&ctx->list);
+        kfree(ctx);
+    }
+    mutex_unlock(&uprobe_lock);
+}
+
+// ---------------------------------------------------------
+// --- IOCTL 主处理函数 ---
+// ---------------------------------------------------------
 static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     struct task_struct *task;
     struct pid *pid_struct;
     struct mm_struct *mm;
     long ret = -EINVAL;
     COPY_MEMORY cm;
-    SWBP_INFO bp_info;
+    UPROBE_CONFIG uc;
     void *kbuf = NULL;
-    uint32_t brk_opcode = 0xD4200000; 
 
+    // 读写内存处理
     if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
         if (copy_from_user(&cm, (void __user *)arg, sizeof(cm))) return -EFAULT;
         kbuf = kmalloc(cm.size, GFP_KERNEL);
         if (!kbuf) return -ENOMEM;
     }
+    
+    // Uprobe 配置处理
+    if (cmd == OP_ADD_UPROBE || cmd == OP_DEL_UPROBE) {
+        if (copy_from_user(&uc, (void __user *)arg, sizeof(uc))) return -EFAULT;
+    }
 
     switch (cmd) {
-        case OP_READ_MEM: 
+        case OP_READ_MEM: {
             pid_struct = find_get_pid(cm.pid);
             if (pid_struct) {
                 task = get_pid_task(pid_struct, PIDTYPE_PID);
@@ -160,8 +265,8 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
                     mm = get_task_mm(task);
                     if (mm) {
                         if (read_memory_force(mm, cm.addr, kbuf, cm.size) == 0) {
-                             if (copy_to_user(cm.buffer, kbuf, cm.size)) ret = -EFAULT;
-                             else ret = 0;
+                            if (copy_to_user(cm.buffer, kbuf, cm.size)) ret = -EFAULT;
+                            else ret = 0;
                         }
                         mmput(mm);
                     }
@@ -169,10 +274,13 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
                 }
                 put_pid(pid_struct);
             }
-            break;
+        } break;
 
-        case OP_WRITE_MEM:
-             pid_struct = find_get_pid(cm.pid);
+        case OP_WRITE_MEM: {
+            if (copy_from_user(kbuf, cm.buffer, cm.size)) {
+                kfree(kbuf); return -EFAULT;
+            }
+            pid_struct = find_get_pid(cm.pid);
             if (pid_struct) {
                 task = get_pid_task(pid_struct, PIDTYPE_PID);
                 if (task) {
@@ -185,56 +293,17 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
                 }
                 put_pid(pid_struct);
             }
-            break;
+        } break;
 
-        case OP_SET_SWBP:
-            if (copy_from_user(&bp_info, (void __user *)arg, sizeof(bp_info))) return -EFAULT;
+        // 处理 Uprobe
+        case OP_ADD_UPROBE:
+            ret = add_uprobe(uc.pid, uc.addr);
+            break;
             
-            g_target_pid = bp_info.pid;
-            g_target_addr = bp_info.addr;
-            // g_orig_insn = bp_info.orig_instruction; // 不需要还原了
-
-            // 1. 注册 Kprobe
-            if (!g_kprobe_registered) {
-                int err = register_kprobe(&kp);
-                if (err < 0) {
-                    printk(KERN_ERR "[Shami] Failed to hook do_debug_exception: %d\n", err);
-                    return err;
-                }
-                g_kprobe_registered = true;
-                printk(KERN_INFO "[Shami] Hooked do_debug_exception (Skip Mode).\n");
-            }
-
-            // 2. 写入 BRK (这里是安全的，因为是在 ioctl 进程上下文中)
-            pid_struct = find_get_pid(g_target_pid);
-            if (pid_struct) {
-                task = get_pid_task(pid_struct, PIDTYPE_PID);
-                if (task) {
-                    mm = get_task_mm(task);
-                    if (mm) {
-                        if (write_memory_force(mm, g_target_addr, &brk_opcode, 4) == 0) {
-                             printk(KERN_ALERT "[Shami] SWBP Set at %lx\n", g_target_addr);
-                             ret = 0;
-                        } else {
-                             ret = -EFAULT;
-                        }
-                        mmput(mm);
-                    }
-                    put_task_struct(task);
-                }
-                put_pid(pid_struct);
-            }
+        case OP_DEL_UPROBE:
+            ret = del_uprobe(uc.pid, uc.addr);
             break;
-
-        case OP_DEL_SWBP:
-            if (g_kprobe_registered) {
-                unregister_kprobe(&kp);
-                g_kprobe_registered = false;
-                printk(KERN_INFO "[Shami] Kprobe removed.\n");
-            }
-            ret = 0;
-            break;
-
+        
         default:
             ret = 0;
             break;
@@ -244,6 +313,7 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
     return ret;
 }
 
+// --- 驱动注册逻辑 ---
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .unlocked_ioctl = shami_ioctl,
@@ -258,15 +328,18 @@ static int __init shami_init(void) {
     if (major < 0) return major;
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Driver Loaded (Skip Instruction Mode).\n");
+    printk(KERN_INFO "[Shami] Driver Loaded with Uprobe support.\n");
     return 0;
 }
 
 static void __exit shami_exit(void) {
-    if (g_kprobe_registered) unregister_kprobe(&kp);
+    // 卸载前必须清除所有探针，否则会崩溃
+    clean_all_uprobes();
+    
     device_destroy(shami_class, MKDEV(major, 0));
     class_destroy(shami_class);
     unregister_chrdev(major, DEVICE_NAME);
+    printk(KERN_INFO "[Shami] Driver Unloaded.\n");
 }
 
 module_init(shami_init);
