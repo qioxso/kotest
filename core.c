@@ -86,35 +86,28 @@ static int my_die_handler(struct notifier_block *self, unsigned long val, void *
         return NOTIFY_DONE; 
     }
 
-    // 2. 确认是否是我们的断点地址触发的异常
-    // 注意：BRK 触发时，PC 指针通常指向 BRK 指令的地址
+    // 2. 确认是否是我们的断点地址
     if (regs->pc != g_target_addr) {
         return NOTIFY_DONE;
     }
 
     printk(KERN_ALERT "\n[Shami] >>> BP HIT! Resuming... <<<\n");
-    // 打印你关心的寄存器
+    // 打印寄存器 (PC, X0-X3, X8)
     printk(KERN_ALERT "PC: %016llx  X0: %016llx  X1: %016llx\n", regs->pc, regs->regs[0], regs->regs[1]);
     printk(KERN_ALERT "X2: %016llx  X3: %016llx  X8: %016llx\n", regs->regs[2], regs->regs[3], regs->regs[8]);
     
     // 3. [关键步骤] 还原指令！
-    // 我们把原本的指令写回内存，覆盖掉 BRK
-    // 因为我们在异常上下文中，直接用 write_memory_force 是最方便的
-    // 注意：这里用 current->mm 是安全的，因为当前就是目标进程的上下文
     if (g_orig_insn != 0) {
+        // 使用 current->mm 进行写入，因为当前就在目标进程上下文
         int ret = write_memory_force(current->mm, g_target_addr, &g_orig_insn, 4);
         if (ret == 0) {
             printk(KERN_ALERT "[Shami] Instruction restored: %08x\n", g_orig_insn);
         } else {
             printk(KERN_ERR "[Shami] Failed to restore instruction!\n");
-            // 如果还原失败，App 肯定会崩溃，但我们尽力了
         }
     }
 
-    // 4. [欺骗内核]
-    // 返回 NOTIFY_STOP，告诉内核 "我处理完了，没事了"。
-    // 内核会直接退出异常处理流程，让 CPU 重新执行当前的 PC。
-    // 因为我们刚刚把 PC 处的指令改回了正确的指令，所以 APP 会继续正常运行！
+    // 4. [欺骗内核] 返回 NOTIFY_STOP，让内核认为异常已处理，继续执行
     return NOTIFY_STOP;
 }
 
@@ -128,6 +121,11 @@ static struct notifier_block my_nb = {
 // ==========================================
 
 static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    // >>> 修复点：补全了变量定义 <<<
+    struct task_struct *task;
+    struct pid *pid_struct;
+    struct mm_struct *mm;
+    
     long ret = -EINVAL;
     COPY_MEMORY cm;
     SWBP_INFO bp_info;
@@ -161,7 +159,6 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             break;
 
         case OP_WRITE_MEM:
-            // ... (同上，省略重复代码) ...
             if (copy_from_user(kbuf, cm.buffer, cm.size)) { kfree(kbuf); return -EFAULT; }
              pid_struct = find_get_pid(cm.pid);
             if (pid_struct) {
@@ -186,13 +183,10 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             g_orig_insn = bp_info.orig_instruction; // 保存原始指令
 
             // 1. 注册异常捕获
-            // 为了防止重复注册报错，先尝试卸载
             unregister_die_notifier(&my_nb);
             register_die_notifier(&my_nb);
 
             // 2. 写入 BRK 指令
-            // 我们需要在内核里帮用户写入 BRK，而不是让用户在 test.cpp 里写
-            // 这样更原子化
             pid_struct = find_get_pid(g_target_pid);
             if (pid_struct) {
                 task = get_pid_task(pid_struct, PIDTYPE_PID);
@@ -216,8 +210,6 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
 
         case OP_DEL_SWBP:
             unregister_die_notifier(&my_nb);
-            // 这里可选：如果用户想手动移除断点，也可以把 g_orig_insn 写回去
-            // 但通常触发一次后就会自动移除
             printk(KERN_ALERT "[Shami] SWBP Removed\n");
             ret = 0;
             break;
