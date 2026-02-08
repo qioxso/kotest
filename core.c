@@ -18,7 +18,7 @@
 
 #define DEVICE_NAME "shami"
 
-// 保存 CPU 全局断点的指针
+// 保存 CPU 全局断点的指针 (每个 CPU 一个)
 static struct perf_event * __percpu *g_bp_events = NULL;
 // 全局过滤 PID
 static pid_t g_target_pid = 0; 
@@ -94,88 +94,59 @@ static void my_bp_handler(struct perf_event *bp,
     printk(KERN_ALERT "X0: %016llx  X1: %016llx\n", regs->regs[0], regs->regs[1]);
     printk(KERN_ALERT "X2: %016llx  X3: %016llx\n", regs->regs[2], regs->regs[3]);
     
-    // [修复点] 使用 perf_event_disable 替代 hw_breakpoint_disable
-    // 这里的 bp 就是 struct perf_event 指针
+    // [修复点] 使用 perf_event_disable 替代 hw_breakpoint_disable (5.10内核专用)
     perf_event_disable(bp);
     
     printk(KERN_ALERT "[Shami] Breakpoint disabled to prevent loop.\n");
 }
 
-// 安装全局断点 (带 Pinned 属性)
-static int install_wide_breakpoint(pid_t pid, uintptr_t addr) {
-    struct perf_event_attr attr;
-    int err;
-
+// 移除全局断点 (前置声明或调整位置，确保在 install 中调用前已定义)
+static void uninstall_wide_breakpoint(void) {
     if (g_bp_events) {
         unregister_wide_hw_breakpoint(g_bp_events);
         g_bp_events = NULL;
+        printk(KERN_INFO "[Shami] HWBP Removed.\n");
     }
-
-    g_target_pid = pid;
-
-    hw_breakpoint_init(&attr);
-    attr.bp_addr = addr;
-    attr.bp_len = HW_BREAKPOINT_LEN_4;
-    attr.bp_type = HW_BREAKPOINT_X;
-    
-    // >>> 关键修改点: 强占模式 <<<
-    attr.pinned = 1;     // 必须驻留
-    attr.exclusive = 1;  // 独占模式
-
-    g_bp_events = register_wide_hw_breakpoint(&attr, my_bp_handler, NULL);
-
-    if (IS_ERR((void __force *)g_bp_events)) {
-        err = PTR_ERR((void __force *)g_bp_events);
-        printk(KERN_ERR "[Shami] Failed to install PINNED HWBP: %d\n", err);
-        g_bp_events = NULL;
-        return err;
-    }
-
-    printk(KERN_INFO "[Shami] PINNED HWBP Installed at 0x%lx\n", addr);
-    return 0;
 }
 
+// 安装全局断点 (带 Pinned 和 Exclude Kernel 属性)
 static int install_wide_breakpoint(pid_t pid, uintptr_t addr) {
     struct perf_event_attr attr;
     int err;
 
+    // 1. 如果已有断点，先移除
     if (g_bp_events) {
-        unregister_wide_hw_breakpoint(g_bp_events);
-        g_bp_events = NULL;
+        uninstall_wide_breakpoint();
     }
 
     g_target_pid = pid;
 
+    // 2. 初始化属性
     hw_breakpoint_init(&attr);
     attr.bp_addr = addr;
     attr.bp_len = HW_BREAKPOINT_LEN_4;
     attr.bp_type = HW_BREAKPOINT_X;
     
-    // >>>>>>>>>> 修改开始 <<<<<<<<<<
+    // >>> 关键修改点: 强占模式 + 用户态优化 <<<
+    attr.pinned = 1;     // 必须驻留 (High Priority)
+    attr.exclusive = 1;  // 独占模式
     
-    // 1. 强占模式 (保持开启)
-    attr.pinned = 1;     
-    attr.exclusive = 1;  
-
-    // 2. 缩小监控范围 (关键修改!)
-    // 显式告诉内核：我们不监控内核态和虚拟机，只监控用户APP
-    // 这有助于避开一些系统级的冲突
+    // [新加优化] 只监控用户态。这可以极大减少资源冲突，
+    // 因为很多系统监控只关心内核态或全局，我们避开它们。
     attr.exclude_kernel = 1; 
-    attr.exclude_hv = 1;     
+    attr.exclude_hv = 1; 
 
-    // >>>>>>>>>> 修改结束 <<<<<<<<<<
-
+    // 3. 注册全局断点
     g_bp_events = register_wide_hw_breakpoint(&attr, my_bp_handler, NULL);
 
     if (IS_ERR((void __force *)g_bp_events)) {
         err = PTR_ERR((void __force *)g_bp_events);
-        // 打印更详细的错误
-        printk(KERN_ERR "[Shami] Failed to install HWBP: %d (Addr: %lx, PID: %d)\n", err, addr, pid);
+        printk(KERN_ERR "[Shami] Failed to install HWBP: %d\n", err);
         g_bp_events = NULL;
         return err;
     }
 
-    printk(KERN_INFO "[Shami] HWBP Installed at 0x%lx (User-Mode Only)\n", addr);
+    printk(KERN_INFO "[Shami] PINNED HWBP Installed at 0x%lx (User-Mode Only)\n", addr);
     return 0;
 }
 
@@ -268,7 +239,7 @@ static int __init shami_init(void) {
     if (major < 0) return major;
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Driver Loaded (Pinned/Force Mode).\n");
+    printk(KERN_INFO "[Shami] Driver Loaded (Pinned/User-Mode).\n");
     return 0;
 }
 
