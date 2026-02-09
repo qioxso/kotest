@@ -87,6 +87,52 @@ struct my_uprobe_ctx {
 static LIST_HEAD(uprobe_list);
 static DEFINE_MUTEX(uprobe_lock);
 
+
+// --- 辅助函数：打印用户态堆栈 ---
+// 仅适用于 AArch64 (ARM64)
+static void print_user_stack(struct task_struct *task, struct pt_regs *regs) {
+    unsigned long fp;
+    unsigned long stack_content[2]; // [0]=next_fp, [1]=lr
+    int depth = 0;
+    int max_depth = 12; // 最多打印 12 层，防止死循环
+
+    // 获取当前的 Frame Pointer (X29)
+    fp = regs->regs[29];
+
+    pr_err("[Shami] ----------- User Stack Trace -----------\n");
+    
+    // 循环回溯
+    while (depth < max_depth && fp != 0) {
+        // 安全检查：FP 必须是对齐的（8字节对齐），且不能指向内核空间
+        if (fp & 0x7 || fp > 0x7ffffffff000) {
+            break;
+        }
+
+        // 从用户空间读取 16 字节 (Next FP + LR)
+        // 注意：在 Uprobe 处理程序中，current 就是目标进程，可以直接 copy_from_user
+        // 但为了保险（防止缺页中断导致死锁），使用 probe_kernel_read 或 copy_from_user_nofault (新内核)
+        // 这里为了兼容性，我们尝试直接 copy，如果失败就停止
+        if (copy_from_user(stack_content, (void __user *)fp, sizeof(stack_content))) {
+            pr_err("[Shami] #%02d: <Read Error at %lx>\n", depth, fp);
+            break;
+        }
+
+        unsigned long next_fp = stack_content[0];
+        unsigned long lr = stack_content[1];
+
+        // 打印层级和返回地址
+        // 这里的 LR 就是调用者的地址 (Call Site)
+        pr_err("[Shami] #%02d: LR: 0x%016llx\n", depth, lr);
+
+        // 移动到下一帧
+        // 防止环状堆栈死循环
+        if (next_fp == fp) break;
+        fp = next_fp;
+        depth++;
+    }
+    pr_err("[Shami] ----------------------------------------\n");
+}
+
 // 断点触发时的回调函数
 // 注意：该函数在中断上下文中运行，不要执行休眠操作
 // core.c 中修改这个函数
@@ -133,6 +179,8 @@ static int my_uprobe_handler(struct uprobe_consumer *con, struct pt_regs *regs) 
                    i, regs->regs[i]);
         }
     }
+
+    print_user_stack(current, regs);
     
     printk(KERN_INFO "==========================================================\n");
     
