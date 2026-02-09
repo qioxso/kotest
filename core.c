@@ -90,15 +90,51 @@ static DEFINE_MUTEX(uprobe_lock);
 // 断点触发时的回调函数
 // 注意：该函数在中断上下文中运行，不要执行休眠操作
 // core.c 中修改这个函数
+// core.c - 替换原有的 my_uprobe_handler
+
 static int my_uprobe_handler(struct uprobe_consumer *con, struct pt_regs *regs) {
     struct my_uprobe_ctx *ctx = container_of(con, struct my_uprobe_ctx, consumer);
+    int i;
+
+    // 打印头部信息
+    printk(KERN_INFO "================= [Shami Uprobe Monitor] =================\n");
+    printk(KERN_INFO "Target PID: %d | VAddr: 0x%lx\n", ctx->pid, ctx->vaddr);
     
-    // --- ARM64 适配修改 ---
-    printk(KERN_INFO "[Shami] Uprobe HIT! PID: %d, VAddr: 0x%lx\n", ctx->pid, ctx->vaddr);
-    // x86: regs->ip, regs->ax
-    // ARM64: regs->pc (Program Counter), regs->regs[0] (也就是 x0 寄存器，通常是返回值或第一个参数)
-    printk(KERN_INFO "[Shami] REGS - PC: 0x%llx, SP: 0x%llx, X0: 0x%llx\n", 
-           regs->pc, regs->sp, regs->regs[0]);
+    // 1. 打印关键控制寄存器
+    // PC: 当前执行指令位置
+    // SP: 栈顶指针
+    // PSTATE: 处理器状态(进位/零标志等)
+    printk(KERN_INFO "PC : %016llx | SP : %016llx | PSTATE: %08llx\n", 
+           regs->pc, regs->sp, regs->pstate);
+
+    // 2. 打印链接寄存器 (LR/X30) 和 帧指针 (FP/X29)
+    // LR: 函数返回地址 (谁调用了我)
+    // FP: 栈帧基址
+    printk(KERN_INFO "LR (X30): %016llx | FP (X29): %016llx\n", 
+           regs->regs[30], regs->regs[29]);
+
+    printk(KERN_INFO "-------------------- General Registers -------------------\n");
+
+    // 3. 循环打印通用寄存器 X0 - X28 (X29/X30 已在上面打印)
+    // 每行打印 3 个寄存器，格式整齐
+    for (i = 0; i <= 28; i += 3) {
+        // 处理最后一行可能不足3个的情况（虽然0-28刚好29个，最后剩2个）
+        if (i + 2 <= 28) {
+            printk(KERN_INFO "X%02d: %016llx | X%02d: %016llx | X%02d: %016llx\n",
+                   i, regs->regs[i],
+                   i + 1, regs->regs[i+1],
+                   i + 2, regs->regs[i+2]);
+        } else if (i + 1 <= 28) {
+            printk(KERN_INFO "X%02d: %016llx | X%02d: %016llx\n",
+                   i, regs->regs[i],
+                   i + 1, regs->regs[i+1]);
+        } else {
+            printk(KERN_INFO "X%02d: %016llx\n",
+                   i, regs->regs[i]);
+        }
+    }
+    
+    printk(KERN_INFO "==========================================================\n");
     
     return 0;
 }
